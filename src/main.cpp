@@ -1,0 +1,1020 @@
+#include <cstdio>
+#include <cstring>
+#include <atomic>
+
+#include "main.h"
+#include "wizchip_conf.h"
+#define U8X8
+
+#if defined(U8X8)
+#include "oledLib.h"
+#endif  /* U8X8 */
+
+#if defined(U8X8)
+
+#include "u8x8.h"
+//#include "main.h"
+#include "adc.h"
+
+#include "gpsLib.h"
+
+#include "dns.h"
+#include "dhcp.h"
+#include "socket.h"
+
+//#define TCP_SERVER
+#define PORT 8088
+#define USE_DHCP
+#define SERVER_NAME "SrvSTM32"
+#define CLIENT_NAME "CliSTM32"
+
+#if defined TCP_SERVER
+#define HOST_NAME SERVER_NAME
+#endif	/* TCP_SERVER */
+
+#if defined TCP_CLIENT
+#define HOST_NAME CLIENT_NAME
+#endif	/* TCP_CLIENT */
+
+extern "C" void w5500_init();
+void lora_init();
+int serverLoop();
+void clientLoop();
+
+inline uint32_t millis()
+{
+ return uwTick;
+}
+
+void delay(int dTime)
+{
+ uint32_t t0 = millis();
+ while ((millis() - t0) < dTime)
+  ;
+}
+
+extern I2C_HandleTypeDef hi2c1; // your I2C handle
+
+// ReSharper disable once CppParameterMayBeConstPtrOrRef
+uint8_t u8x8_byte_stm32_hw_i2c(u8x8_t* u8x8p, uint8_t msg,
+                               // ReSharper disable once CppParameterMayBeConstPtrOrRef
+                               uint8_t arg_int, void* arg_ptr)
+{
+ static uint8_t buffer[32]; // U8g2 sends at most 32 bytes per transfer
+ static uint8_t idx;
+
+ switch (msg)
+ {
+ case U8X8_MSG_BYTE_SEND:
+  {
+   const auto* src = static_cast<const uint8_t*>(arg_ptr);
+   for (uint8_t i = 0; i < arg_int; i++)
+   {
+    if (idx < sizeof(buffer)) buffer[idx++] = src[i];
+   }
+   break;
+  }
+ case U8X8_MSG_BYTE_INIT:
+  break; // I2C is already initialised by CubeMX
+ case U8X8_MSG_BYTE_START_TRANSFER:
+  idx = 0;
+  break;
+ case U8X8_MSG_BYTE_END_TRANSFER:
+  // u8x8_GetI2CAddress() is already the 8-bit (shifted) address the HAL expects
+  if (HAL_I2C_Master_Transmit(&hi2c1, u8x8_GetI2CAddress(u8x8p), buffer, idx, 20) != HAL_OK)
+  {
+   return 0;
+  }
+  break;
+ default:
+  return 0;
+ }
+ return 1;
+}
+
+uint8_t u8x8_gpio_and_delay_stm32(u8x8_t* u8x8p, uint8_t msg,
+                                  uint8_t arg_int, void* arg_ptr)
+{
+ switch (msg)
+ {
+ case U8X8_MSG_DELAY_MILLI:
+  HAL_Delay(arg_int);
+  break;
+ case U8X8_MSG_GPIO_AND_DELAY_INIT:
+ case U8X8_MSG_DELAY_10MICRO:
+ case U8X8_MSG_DELAY_100NANO:
+ case U8X8_MSG_DELAY_NANO:
+ case U8X8_MSG_DELAY_I2C:
+  break; // not needed for hardware I2C
+ default:
+  return 0;
+ }
+ return 1;
+}
+
+u8x8_t u8g8;
+
+void u8x8Init()
+{
+ u8x8_Setup(&u8x8, u8x8_d_sh1106_128x64_noname,
+            u8x8_cad_ssd13xx_i2c,
+            u8x8_byte_stm32_hw_i2c,
+            u8x8_gpio_and_delay_stm32);
+
+ u8x8_InitDisplay(&u8g8);
+ u8x8_SetPowerSave(&u8g8, 0);
+
+ u8x8_SetI2CAddress(&u8x8, 0x3C << 1); // 7-bit 0x3C shifted, u8x8 uses 8-bit convention
+
+ u8x8_InitDisplay(&u8x8);
+ u8x8_SetPowerSave(&u8x8, 0);
+ u8x8_ClearDisplay(&u8x8);
+
+ u8x8_SetFont(&u8x8, u8x8_font_chroma48medium8_r);
+ u8x8_DrawString(&u8x8, 0, 6, "Hello SrvSTM32");
+ u8x8_DrawString(&u8x8, 0, 7, "0123456789012345");
+ printf("U8x8Init done\n");
+
+ HAL_ADCEx_Calibration_Start(&hadc1, ADC_SINGLE_ENDED);
+}
+
+void displayTemp()
+{
+ HAL_ADC_Start(&hadc1);
+ int temp = 0;
+ if (HAL_ADC_PollForConversion(&hadc1, 10) == HAL_OK)
+ {
+  uint32_t raw = HAL_ADC_GetValue(&hadc1);
+  HAL_ADC_Stop(&hadc1);
+
+  // VDDA in mV, e.g. 3300. Use your actual analog supply voltage.
+  temp = __LL_ADC_CALC_TEMPERATURE(3300, raw, LL_ADC_RESOLUTION_12B);
+ }
+ char buf[20];
+ snprintf(buf, sizeof(buf), "    %2d %4d ", temp, rtk.rxCount);
+ drawString(0, 1, buf);
+}
+
+#endif
+
+#if defined(USE_DHCP)
+
+#define DHCP_RETRY_COUNT 5
+#define DNS_RETRY_COUNT 5
+
+#define SOCKET_DHCP 2
+#define SOCKET_DNS 3
+
+#endif  /* USE_DHCP */
+
+#define ETHERNET_BUF_MAX_SIZE (1024 * 2)
+#define DATA_BUF_SIZE 2048
+
+#define SOCKET_TCP_SERVER 0
+#define SOCKET_TCP_CLIENT 1
+
+static wiz_NetInfo g_net_info =
+{
+ .mac =  {0},			// MAC address
+ .ip =   {0},			// IP address
+ .sn =   {255, 255, 255, 0},	// Subnet Mask
+ .gw =   {192, 168, 0, 1},	// Gateway
+ .dns =  {192, 168, 0, 18},	// DNS server
+ .dhcp = NETINFO_DHCP,
+};
+
+#if defined(TCP_SERVER)
+/* Loopback */
+static uint8_t g_tcp_server_buf[ETHERNET_BUF_MAX_SIZE] = { 0, };
+#endif	/* TCP_SERVER */
+
+#if defined(TCP_CLIENT)
+uint8_t tcp_client_destip[] = {
+ 192, 168, 50, 103
+};
+
+uint16_t tcp_client_destport = PORT;
+
+static uint8_t g_tcp_client_buf[ETHERNET_BUF_MAX_SIZE] = { 0, };
+#endif	/* TCP_CLIENT */
+
+#if defined(USE_DHCP)
+static uint8_t g_ethernet_buf[ETHERNET_BUF_MAX_SIZE] = { 0, };
+
+/* DHCP */
+static uint8_t g_dhcp_get_ip_flag = 0;
+
+/* DNS */
+#if defined(TCP_SERVER)
+auto g_dns_target_domain = const_cast<uint8_t *>(reinterpret_cast<const uint8_t *>(SERVER_NAME));
+#endif	/* TCP_SERVER */
+#if defined(TCP_CLIENT)
+auto g_dns_target_domain = const_cast<uint8_t *>(reinterpret_cast<const uint8_t *>(CLIENT_NAME));
+#endif	/* TCP_CLIENT */
+
+static uint8_t g_dns_target_ip[4] = { 0, };
+static uint8_t g_dns_get_ip_flag = 0;
+
+#endif	/* USE_DHCP */
+
+void print_network_information(wiz_NetInfo net_info);
+
+#if defined(USE_DHCP)
+/* DHCP */
+static void wizchip_dhcp_init();
+static void wizchip_dhcp_assign();
+static void wizchip_dhcp_conflict();
+
+#endif	/* USE_DHCP */
+
+void printMac(const char *mac_address)
+{
+ printf("%02x:%02x:%02x:%02x:%02x:%02x",
+        mac_address[0], mac_address[1], mac_address[2],
+        mac_address[3], mac_address[4], mac_address[5]);
+}
+
+#define SEED 0xDEADBEEF	     /* Simple 64-bit hash (CityHash-style) */
+
+// ReSharper disable once CppDFAConstantParameter
+static uint64_t hash64(const uint8_t *data, size_t len)
+{
+ constexpr uint64_t m = 0xc6a4a7935bd1e995ULL;
+ uint64_t h = SEED ^ (len * m);
+ const auto *pos = reinterpret_cast<const uint64_t*>(data);
+ const uint64_t *end = pos + (len / 8);
+
+ while (pos != end)
+ {
+  uint64_t v = *pos++;
+  v *= m;
+  v ^= v >> 47;
+  h ^= v;
+  h *= m;
+ }
+
+ const auto *tail = reinterpret_cast<const uint8_t*>(pos);
+ uint64_t v = 0;
+ switch (len & 7)
+ {
+ case 7: v ^= static_cast<uint64_t>(tail[6]) << 48;
+ case 6: v ^= static_cast<uint64_t>(tail[5]) << 40;
+ case 5: v ^= static_cast<uint64_t>(tail[4]) << 32;
+ case 4: v ^= static_cast<uint64_t>(tail[3]) << 24;
+ case 3: v ^= static_cast<uint64_t>(tail[2]) << 16;
+ case 2: v ^= static_cast<uint64_t>(tail[1]) << 8;
+ case 1: v ^= static_cast<uint64_t>(tail[0]);
+  v *= m;
+  h ^= v;
+  h ^= h >> 33;
+  h *= m;
+  h ^= h >> 33;
+  return h;
+  
+ default:
+  break;
+ }
+ return h;
+}
+
+//#define UID_BASE (0x08FFF800UL)
+
+void get_mac_address(uint8_t mac[6])
+{
+ uint8_t uid[12];
+ for (int i = 0; i < 3; i++)
+ {
+  uint32_t w = *reinterpret_cast<volatile uint32_t*>((UID_BASE + i * 4));
+  memcpy(&uid[i * 4], &w, 4);
+ }
+
+ uint64_t h = hash64(uid, 12);
+ memcpy(mac, &h, 6);
+
+ /* Set locally administered bit (bit 1), clear multicast bit (bit 0) */
+ mac[0] |= 0x02;
+ mac[0] &= ~0x01;
+}   
+
+void wizchip_reset()
+{
+ W5500_RST_GPIO_Port->BSRR = W5500_RST_Pin;
+ delay(10);
+ W5500_RST_GPIO_Port->BSRR = W5500_RST_Pin << 16;
+ delay(50);
+}
+
+char serialBuf[256];
+uint64_t dhcpT0;
+
+void networkInit(bool first)
+{
+ printf("networkInit\n");
+ int retval = 0;
+
+ wizchip_reset();
+ w5500_init();
+
+ get_mac_address(g_net_info.mac);
+ // network_initialize(g_net_info);
+ ctlnetwork(CN_SET_NETINFO, &g_net_info);
+ print_network_information(g_net_info);
+
+#if defined(USE_DHCP)
+
+ int dhcp_retry = 0;
+ int dns_retry = 0;
+
+ // if (first)
+ //  wizchip_1ms_timer_initialize(repeating_timer_callback);
+
+ wizchip_dhcp_init();
+
+ DNS_init(SOCKET_DNS, g_ethernet_buf);
+
+ g_dhcp_get_ip_flag = 0;
+ while (g_dhcp_get_ip_flag == 0)
+ {
+  if (g_net_info.dhcp == NETINFO_DHCP)
+  {
+   retval = DHCP_run();
+   if (retval == DHCP_IP_LEASED)
+   {
+    if (g_dhcp_get_ip_flag == 0)
+    {
+     printf(" DHCP success\n");
+     g_dhcp_get_ip_flag = 1;
+    }
+   }
+   else if (retval == DHCP_FAILED)
+   {
+    g_dhcp_get_ip_flag = 0;
+    dhcp_retry++;
+
+    if (dhcp_retry <= DHCP_RETRY_COUNT)
+    {
+     printf(" DHCP timeout occurred and retry %d\n", dhcp_retry);
+    }
+   }
+
+   if (dhcp_retry > DHCP_RETRY_COUNT)
+   {
+    printf(" DHCP failed\n");
+    DHCP_stop();
+    // ReSharper disable once CppDFAEndlessLoop
+    while (true)
+    {
+    }
+   }
+
+   delay(1000); // wait for 1 second
+  }
+
+  /* Get IP through DNS */
+  if ((g_dns_get_ip_flag == 0) && (retval == DHCP_IP_LEASED))
+  {
+   printf(" starting DNS loop %s\n", reinterpret_cast<const char*>(g_dns_target_domain));
+   // ReSharper disable once CppDFAEndlessLoop
+   while (true)
+   {
+    retval = static_cast<unsigned char>(DNS_run(g_net_info.dns, g_dns_target_domain,
+                                                g_dns_target_ip));
+    if (retval > 0)
+    {
+     printf(" DNS success\n");
+     printf(" Target domain : %s\n", reinterpret_cast<const char*>(g_dns_target_domain));
+     printf(" IP of target domain : %d.%d.%d.%d\n",
+	    g_dns_target_ip[0], g_dns_target_ip[1], g_dns_target_ip[2], g_dns_target_ip[3]);
+     g_dns_get_ip_flag = 1;
+     break;
+    }
+    else
+    {
+     dns_retry++;
+     if (dns_retry <= DNS_RETRY_COUNT)
+     {
+      printf(" DNS timeout occurred and retry %d\n", dns_retry);
+     }
+    }
+
+    if (dns_retry > DNS_RETRY_COUNT)
+    {
+     printf(" DNS failed\n");
+     // ReSharper disable once CppDFAEndlessLoop
+     while (true);
+    }
+
+    delay(1000); // wait for 1 second
+   }
+  }
+ }
+
+#endif	/* USE_DHCP */
+
+ /* Get network information */
+ // print_network_information(g_net_info);
+}
+
+extern "C" void setup()
+{
+ printf("Compiled @ %s, %s\n", __DATE__, __TIME__);
+
+ u8x8Init();
+ lora_init();
+
+ buildCRC24qTable();
+
+ networkInit(false);
+
+#if defined(U8X8)
+ char tmp[20];
+ snprintf(tmp, sizeof(tmp), "%d.%d.%d.%d %c", g_net_info.ip[0], g_net_info.ip[1],
+	  g_net_info.ip[2], g_net_info.ip[3], HOST_NAME[0]);
+ drawString(0, 0, tmp);
+#endif	/* USE_U8X8 */
+
+#if defined(TCP_SERVER)
+ serverLoop();
+#endif	/* TCP_SERVER */
+
+#if defined(TCP_CLIENT)
+ clientLoop();
+#endif	/* TCP_CLIent */
+
+}
+
+#define GPS_UART USART6
+#define GPS_IRQHandler USART6_IRQHandler 
+
+inline void readUart()
+{
+ rtk.isrCount += 1;
+
+ uint32_t fil = rtk.iFil.load(std::memory_order_relaxed);
+ const uint32_t emp = rtk.iEmp.load(std::memory_order_acquire);
+ uint32_t free = (RTK_BUF_SIZE - 1) - ((fil - emp) & (RTK_BUF_SIZE - 1));
+ while (!(GPS_UART->ISR & USART_ISR_RXNE))
+ {
+  const char c = static_cast<char>(GPS_UART->RDR);
+  if (free > 0)
+  {
+   free -= 1;
+   rtk.iBuf[fil++] = c;
+   fil &= RTK_BUF_SIZE - 1;
+   rtk.isrByteCount += 1;
+  }
+  else
+   rtk.isrOverflowCount += 1;
+ }
+ rtk.iFil.store(fil, std::memory_order_release);
+}
+
+inline void writeUart();
+
+bool queueUart(const char c)
+{
+ uint32_t fil = rtk.tFil.load(std::memory_order_relaxed);
+ const uint32_t emp = rtk.tEmp.load(std::memory_order_acquire);
+ if (const uint32_t free = (ISR_BUF_SIZE - 1) - (fil - emp) & (ISR_BUF_SIZE - 1);
+     free != 0)
+ {
+  rtk.tBuf[fil++] = c;
+  fil &= ISR_BUF_SIZE - 1;
+  rtk.tFil.store(fil, std::memory_order_release);
+  GPS_UART->CR1 |= USART_CR1_TXEIE_TXFNFIE;
+  return true;
+ }
+ return false;
+}
+
+inline void writeUart()
+{
+ uint32_t emp = rtk.tEmp.load(std::memory_order_relaxed);
+ const uint32_t fil = rtk.tFil.load(std::memory_order_acquire);
+ while (emp != fil && (GPS_UART->ISR & USART_ISR_TXE_TXFNF))
+ {
+  GPS_UART->TDR = rtk.tBuf[emp++];
+  emp &= ISR_BUF_SIZE - 1;
+ }
+ rtk.tEmp.store(emp, std::memory_order_release);
+ if (emp == fil)
+  GPS_UART->CR1 &= ~USART_CR1_TXEIE_TXFNFIE;
+}
+
+#if 0
+void core1_entry()
+{
+ printf("core 1 started core %d\n", get_core_num());
+#if 1
+ uart_set_irqs_enabled(uart1, true, false);
+ irq_set_enabled(UART1_IRQ, true);
+ hw_write_masked(&uart_get_hw(uart1)->ifls,
+                2 << UART_UARTIFLS_RXIFLSEL_LSB,   // 0b010 = 1/2 full (16 bytes)
+                UART_UARTIFLS_RXIFLSEL_BITS);
+ while (true)
+  __WFI();
+ // asm volatile ("wfi");
+#endif
+}
+#endif
+
+extern "C" void GPS_IRQHandler(void)
+{
+ if (GPS_UART->ISR & (USART_ISR_ORE | USART_ISR_FE | USART_ISR_NE | USART_ISR_PE))
+  GPS_UART->ICR = USART_ICR_ORECF | USART_ICR_FECF | USART_ICR_NECF | USART_ICR_PECF;
+ if (GPS_UART->ISR & USART_ISR_RXNE_RXFNE)
+ {
+  dbg3Set();
+  readUart();
+  dbg3Clr();
+ }
+
+ if (GPS_UART->ISR & USART_ISR_TXE_TXFNF)
+ {
+  rtk.tIsrCount += 1;
+  dbg2Set();
+  writeUart();
+  dbg2Clr();
+ }
+}
+
+#if defined(TCP_SERVER)
+
+//#define DHCP_INTERVAL (3600 * 1000000ULL)
+#define DHCP_INTERVAL (300 * 1000000ULL)
+int32_t loopback_tcps(uint8_t sn, uint8_t* buf, uint16_t port);
+
+int serverLoop()
+{
+ dhcpT0 = millis();
+
+ static uint32_t secTimer;
+ static bool phyDown = false;
+
+ setSn_KPALVTR(SOCKET_TCP_SERVER, 30); /* keep alive timer */
+
+ while (true)  // server main loop
+ {
+  const auto t32 = millis();
+
+  static uint32_t tmr0;
+  if ((t32 - tmr0) > 1000)
+  {
+   tmr0 = t32;
+
+   DHCP_time_handler();
+   DNS_time_handler();
+
+#if defined(U8X8)
+   displayTemp();
+#endif	/* USE_U8X8 */
+  }
+
+  pollSerial();
+
+  const uint8_t status = getSn_SR(SOCKET_TCP_SERVER);
+
+  if (status == SOCK_ESTABLISHED)
+  {
+   rtk.tData = t32;	    /* temporary add keep alive from client */
+   processSerial(SOCKET_TCP_SERVER);
+
+#if defined(U8X8)
+
+   if (gpsInfo.update)
+   {
+    gpsInfo.update = false;
+    char buf[20];
+    drawString(0, 2, gpsInfo.timeBuf);
+    snprintf(buf, sizeof(buf), "%d %2d   ", gpsInfo.fix, gpsInfo.sats);
+    drawString(9, 2, buf);  // 9 10 11 12 13 14 15
+
+    snprintf(buf, sizeof(buf), " %13.10f", gpsInfo.lat);
+    drawString(0, 3, buf);
+    snprintf(buf, sizeof(buf), "%14.10f", gpsInfo.lon);
+    drawString(0, 4, buf);
+   }
+
+#endif	/* USE_U8X8 */
+
+  }
+  else				/* flush data if no connection */
+  {
+   const uint32_t fil = rtk.iFil.load(std::memory_order_acquire);
+   rtk.iEmp.store(fil, std::memory_order_release);
+  }
+
+  if (t32 - secTimer > 1000000)
+  {
+   secTimer = t32;
+
+   if (status == SOCK_ESTABLISHED)
+   {
+    printf("t %u\n", static_cast<unsigned int>(t32 - rtk.tData));
+    if ((t32 - rtk.tData) > (10 * 1000000))
+    {
+     rtk.tData = t32;
+     uint8_t temp;
+     if (ctlwizchip(CW_GET_PHYLINK, &temp) == -1)
+     {
+      printf(" Unknown PHY link status\n");
+     }
+     else
+     {
+      printf(" PHY link status %d\n", temp);
+      if (temp == PHY_LINK_OFF)
+      {
+       phyDown = true;
+       printf("phy link off\n");
+      }
+      else
+      {
+       if (phyDown)
+       {
+        phyDown = false;
+        networkInit(false);
+       }
+       else
+       {
+        printf("disconnect\n");
+        disconnect(SOCKET_TCP_SERVER);
+       }
+      }
+     }
+    }
+   }
+  }
+
+  if (const int retval = loopback_tcps(SOCKET_TCP_SERVER, g_tcp_server_buf, PORT);
+      retval < 0)
+  {
+   printf(" loopback_tcps error : %d\n", retval);
+   // ReSharper disable once CppDFAEndlessLoop
+   while (true)
+   {}
+  }
+ }
+ // ReSharper disable once CppDFAUnreachableCode
+ printf("exit main\n");
+}
+
+#define LOG_SERVER
+
+#if defined(LOG_SERVER)
+    #define LOG_S(...) printf(__VA_ARGS__)
+#else
+    #define LOG_S(...) ((void)0)
+#endif	/* LOG_SERVER */
+
+int32_t loopback_tcps(uint8_t sn, uint8_t* buf, uint16_t port)
+{
+ int ret;
+ int size;
+ switch (getSn_SR(sn))
+ {
+ case SOCK_ESTABLISHED:
+  if (getSn_IR(sn) & Sn_IR_CON)
+  {
+#if defined(LOG_SERVER)
+   uint8_t destip[4];
+   getSn_DIPR(sn, destip);
+   uint16_t destport = getSn_DPORT(sn);
+   printf("%d:Connected - %d.%d.%d.%d : %d\n",
+          sn, destip[0], destip[1], destip[2], destip[3], destport);
+#endif	/* LOG_SERVER */
+
+   setSn_IR(sn, Sn_IR_CON);
+  }
+
+  size = getSn_RX_RSR(sn);
+  if (size > 0) // Don't need to check SOCKERR_BUSY because it doesn't occur.
+  {
+   if (size > DATA_BUF_SIZE)
+    size = DATA_BUF_SIZE;
+   ret = static_cast<int>(recv(sn, buf, size));
+   if (ret <= 0)
+    return ret; // check SOCKERR_BUSY & SOCKERR_XXX. For showing the occurrence of SOCKERR_BUSY.
+   size = static_cast<uint16_t>(ret);
+
+   rtk.tData = millis();
+   processRemData(buf, size);
+  }
+  break;
+
+ case SOCK_CLOSE_WAIT:
+   LOG_S("%d:Socket Closed\n", sn);
+   ret = static_cast<int>(static_cast<unsigned char>(disconnect(sn)));
+   if (ret != SOCK_OK)
+    return ret;
+  break;
+
+ case SOCK_INIT:
+  LOG_S("%d:Listen, TCP server loopback, port [%d]\n", sn, port);
+  ret = static_cast<int>(static_cast<unsigned char>(listen(sn)));
+  if (ret != SOCK_OK)
+   return ret;
+  break;
+
+ case SOCK_CLOSED:
+  LOG_S("%d:Socket close\n", sn);
+  ret = static_cast<int>(static_cast<unsigned char>(socket(sn, Sn_MR_TCP, port, 0x00)));
+  if (ret != sn)
+   return ret;
+  break;
+
+ default:
+  break;
+ }
+ return 1;
+}
+
+#endif	/* TCP_SERVER */
+
+#if defined(TCP_CLIENT)
+
+void clientLoop()
+{
+ dhcpT0 = timer_time_us_64(timer_hw);
+
+ lastTime = timer_time_us_64(timer_hw);
+
+ while (true)  // client main loop
+ {
+  const uint32_t t = millis();
+
+  static uint32_t tmr0;
+  if ((t - tmr0) > 1000 * 1000)
+  {
+   tmr0 = t;
+
+   DHCP_time_handler();
+   DNS_time_handler();
+
+#if defined(U8X8)
+   displayTemp();
+#endif	/* USE_U8X8 */
+  }
+
+  if ((t - rtk.lan.t) > (100 * 1000))
+  {
+   rtk.lan.state = RCV_IDLE;
+  }
+
+  int retval = loopback_tcpc(SOCKET_TCP_CLIENT, g_tcp_client_buf,
+			     g_dns_target_ip, tcp_client_destport);
+  if (retval < 0)
+  {
+   printf(" loopback_tcpc error : %d\n", retval);
+
+   // ReSharper disable once CppDFAEndlessLoop
+   while (true)
+    ;
+  }
+ }
+}
+
+#define LOG_CLIENT
+
+#if defined(LOG_CLIENT)
+    #define LOG_C(...) printf(__VA_ARGS__)
+#else
+    #define LOG_C(...) ((void)0)
+#endif	/* LOG_CLIENT */
+
+int32_t loopback_tcpc(uint8_t sn, uint8_t* buf, uint8_t* destip, uint16_t destport)
+{
+ static uint64_t updTime;
+
+ dbg0Set();
+ int32_t ret; // return value for SOCK_ERROR
+
+ // Socket Status Transitions
+ // Check the W5500 Socket n status register
+ // (Sn_SR, The 'Sn_SR' controlled by Sn_CR command or Packet send/recv status)
+
+ const uint8_t status = getSn_SR(sn);
+ const uint8_t ir = getSn_IR(sn);
+ if (status != SOCK_ESTABLISHED)
+ {
+  while (uart_is_readable(uart1))
+   uart_getc(uart1);
+ }
+
+ if (status != lastStatus)
+ {
+  lastStatus = status;
+  const uint32_t t0 = timer_time_us_64(timer_hw);
+  const unsigned int delta = t0 - lastTime;
+  lastTime = t0;
+  printf("status %02x ir %02x, delta us %u\n", status, ir, delta);
+ }
+
+ dbg0Clr();
+ switch (status)
+ {
+ case SOCK_ESTABLISHED:
+  {
+   if (getSn_IR(sn) & Sn_IR_CON)
+   {
+    // Socket n interrupt register mask; TCP CON interrupt = connection with peer is successful
+    LOG_C("%d:Connected to - %d.%d.%d.%d : %d\n",
+          sn, destip[0], destip[1], destip[2], destip[3], destport);
+    setSn_IR(sn, Sn_IR_CON); // this interrupt should write the bit cleared to '1'
+   }
+
+   pollSerial();
+   processSerial(SOCKET_TCP_CLIENT);
+
+#if defined(U8X8)
+
+   if (gpsInfo.update)
+   {
+    gpsInfo.update = false;
+    char tmp[20];
+    drawString(0, 2, gpsInfo.timeBuf);
+    snprintf(tmp, sizeof(tmp), "%d %2d   ", gpsInfo.fix, gpsInfo.sats);
+    drawString(9, 2, tmp);  // 9 10 11 12 13 14 15
+
+    snprintf(tmp, sizeof(tmp), " %13.10f", gpsInfo.lat);
+    drawString(0, 3, tmp);
+    snprintf(tmp, sizeof(tmp), "%14.10f", gpsInfo.lon);
+    drawString(0, 4, tmp);
+   }
+
+#endif	/* USE_U8X8 */
+
+   const uint64_t t = timer_time_us_64(timer_hw);
+   if (size_t size;
+       (size = getSn_RX_RSR(sn)) > 0)
+   {
+    // Sn_RX_RSR: Socket n Received Size Register, Receiving data length
+    if (size > DATA_BUF_SIZE)
+    {
+     size = DATA_BUF_SIZE; // DATA_BUF_SIZE means user defined buffer size (array)
+    }
+
+    ret = recv(sn, buf, size); // Data Receive process (H/W Rx socket buffer -> User's buffer)
+    if (ret <= 0)
+    {
+     return ret; // If the received data length <= 0, receive failed and process end
+    }
+
+    rtk.tData = usTime();
+    processRemData(buf, size);
+    updTime = t;
+   }
+   else
+   {
+    if ((t - updTime) > (20 * 1000000))
+     close(sn);
+   }
+  }
+  break;
+
+ case SOCK_CLOSE_WAIT:
+  LOG_C("%d:Socket Closed\n", sn);
+  if ((ret = static_cast<unsigned char>(disconnect(sn))) != SOCK_OK)
+  {
+   return ret;
+  }
+  break;
+
+ case SOCK_INIT:
+  LOG_C("%d:Try to connect to the %d.%d.%d.%d : %d\n",
+	sn, destip[0], destip[1], destip[2], destip[3],	 destport);
+  timer_time_us_64(timer_hw);
+  if ((ret = static_cast<unsigned char>(connect(sn, destip, destport))) != SOCK_OK)
+  {
+   return ret; //	Try to TCP connect to the TCP server (destination)
+  }
+  break;
+
+ case SOCK_CLOSED:
+  LOG_C("%d:Socket closed\n", sn);
+  updTime = timer_time_us_64(timer_hw);
+  uint8_t addr[4];
+  getSIPR(addr);
+  LOG_C("ip %d.%d.%d.%d\n", addr[0], addr[1], addr[2], addr[3]);
+  if ((ret = static_cast<unsigned char>(socket(sn, Sn_MR_TCP, any_port++, 0x00))) != sn)
+  {
+   LOG_C("Socket opened status %d\n", static_cast<int>(ret));
+   if (any_port == 0xffff)
+   {
+    any_port = 50000;
+   }
+   return ret; // TCP socket open with 'any_port' port number
+  }
+  break
+   ;
+ default:
+  break;
+ }
+
+ return 1;
+}
+
+#endif	/* TCP_CLIENT */
+
+#if defined(USE_DHCP)
+
+static void wizchip_dhcp_init()
+{
+ printf(" DHCP client running\n");
+
+ DHCP_init1(SOCKET_DHCP, g_ethernet_buf, HOST_NAME);
+
+ reg_dhcp_cbfunc(wizchip_dhcp_assign, wizchip_dhcp_assign, wizchip_dhcp_conflict);
+}
+
+static void wizchip_dhcp_assign()
+{
+ getIPfromDHCP(g_net_info.ip);
+ getGWfromDHCP(g_net_info.gw);
+ getSNfromDHCP(g_net_info.sn);
+ getDNSfromDHCP(g_net_info.dns);
+
+ g_net_info.dhcp = NETINFO_DHCP;
+
+ /* Network initialize */
+ //network_initialize(g_net_info); // apply from DHCP
+  wizchip_setnetinfo(&g_net_info);
+
+ print_network_information(g_net_info);
+ printf(" DHCP leased time : %ld seconds\n", getDHCPLeasetime());
+}
+
+static void wizchip_dhcp_conflict()
+{
+ printf(" Conflict IP from DHCP\n");
+
+ // halt or reset or any...
+ // ReSharper disable once CppDFAEndlessLoop
+ while (true);
+ // this example is halt.
+}
+
+#endif  /* USE_DHCP */
+
+void print_network_information(wiz_NetInfo net_info)
+{
+ uint8_t tmp_str[8] = { 0, };
+
+ ctlnetwork(CN_GET_NETINFO, (void*)&net_info);
+ ctlwizchip(CW_GET_ID, (void*)tmp_str);
+#if _WIZCHIP_ <= W5500
+ if (net_info.dhcp == NETINFO_DHCP)
+ {
+  printf(" %s network configuration : DHCP\n\n", reinterpret_cast<char*>(tmp_str));
+ }
+ else
+ {
+  printf(" %s network configuration : static\n\n", reinterpret_cast<char*>(tmp_str));
+ }
+
+ printf(" MAC         : %02X:%02X:%02X:%02X:%02X:%02X\n",
+        net_info.mac[0], net_info.mac[1], net_info.mac[2],
+        net_info.mac[3], net_info.mac[4], net_info.mac[5]);
+ printf(" IP          : %d.%d.%d.%d\n",
+        net_info.ip[0], net_info.ip[1], net_info.ip[2], net_info.ip[3]);
+ printf(" Subnet Mask : %d.%d.%d.%d\n",
+        net_info.sn[0], net_info.sn[1], net_info.sn[2], net_info.sn[3]);
+ printf(" Gateway     : %d.%d.%d.%d\n",
+        net_info.gw[0], net_info.gw[1], net_info.gw[2], net_info.gw[3]);
+ printf(" DNS         : %d.%d.%d.%d\n",
+        net_info.dns[0], net_info.dns[1], net_info.dns[2], net_info.dns[3]);
+#else
+ printf(" %s network configuration\n\n", (char*)tmp_str);
+
+ printf(" MAC         : %02X:%02X:%02X:%02X:%02X:%02X\n",
+        net_info.mac[0], net_info.mac[1], net_info.mac[2], net_info.mac[3],
+        net_info.mac[4], net_info.mac[5]);
+ printf(" IP          : %d.%d.%d.%d\n", net_info.ip[0], net_info.ip[1], net_info.ip[2], net_info.ip[3]);
+ printf(" Subnet Mask : %d.%d.%d.%d\n", net_info.sn[0], net_info.sn[1], net_info.sn[2], net_info.sn[3]);
+ printf(" Gateway     : %d.%d.%d.%d\n", net_info.gw[0], net_info.gw[1], net_info.gw[2], net_info.gw[3]);
+ printf(" DNS         : %d.%d.%d.%d\n", net_info.dns[0], net_info.dns[1], net_info.dns[2], net_info.dns[3]);
+ print_ipv6_addr(" GW6 ", net_info.gw6);
+ print_ipv6_addr(" LLA ", net_info.lla);
+ print_ipv6_addr(" GUA ", net_info.gua);
+ print_ipv6_addr(" SUB6", net_info.sn6);
+ print_ipv6_addr(" DNS6", net_info.dns6);
+#endif
+}
+
+#define UINT16_T(value) (static_cast<uint16_t>(value))
+
+void print_ipv6_addr(uint8_t* name, const uint8_t* ip6addr)
+{
+ printf("%s        : ", reinterpret_cast<char*>(name));
+ printf("%04X:%04X",
+        (UINT16_T(ip6addr[0]) << 8)  | (UINT16_T(ip6addr[ 1])),
+        (UINT16_T(ip6addr[2]) << 8)  | (UINT16_T(ip6addr[ 3])));
+ printf(":%04X:%04X",
+        (UINT16_T(ip6addr[4]) << 8)  | (UINT16_T(ip6addr[ 5])),
+        (UINT16_T(ip6addr[6]) << 8)  | (UINT16_T(ip6addr[ 7])));
+ printf(":%04X:%04X",
+        (UINT16_T(ip6addr[8]) << 8)  | (UINT16_T(ip6addr[ 9])),
+        (UINT16_T(ip6addr[10]) << 8) | (UINT16_T(ip6addr[11])));
+ printf(":%04X:%04X\n",
+        (UINT16_T(ip6addr[12]) << 8) | (UINT16_T(ip6addr[13])),
+        (UINT16_T(ip6addr[14]) << 8) | (UINT16_T(ip6addr[15])));
+}
